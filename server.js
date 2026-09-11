@@ -10,9 +10,11 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
+const databaseUrl = String(process.env.DATABASE_URL || '').trim();
+if (!databaseUrl) throw new Error('DATABASE_URL is required. Add the Supabase Postgres connection string to the deployment environment.');
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  connectionString: databaseUrl,
+  ssl: { rejectUnauthorized: false },
   max: 5
 });
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
