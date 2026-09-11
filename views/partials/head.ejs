@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title><%= title || 'RentMaster' %> | Studio Operations</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="container-fluid p-0 d-flex h-100 app-shell">
+  <nav class="sidebar d-flex flex-column flex-shrink-0 p-3">
+    <a href="/dashboard" class="text-decoration-none mb-4 px-2 d-flex align-items-center"><img src="/uploads/1788973649_R-NT-2.png" class="brand-logo-image" alt="RentMaster logo"></a>
+    <div class="user-panel text-center"><div class="text-muted small">Logged in as:</div><div class="text-white fw-bold mb-1"><i class="fas fa-user-circle text-brand"></i> <%= user.username %></div><span class="badge <%= isAdmin ? 'bg-danger' : 'bg-secondary' %> text-uppercase"><%= user.role %></span></div>
+    <ul class="nav nav-pills flex-column mb-auto">
+      <li><a href="/dashboard" class="nav-link <%= currentPath === '/dashboard' ? 'active' : '' %>"><i class="fas fa-th-large"></i> Dashboard</a></li>
+      <li><a href="/rent" class="nav-link <%= currentPath === '/rent' ? 'active' : '' %>"><i class="fas fa-plus-circle"></i> New Rental</a></li>
+      <li><a href="/equipment" class="nav-link <%= currentPath === '/equipment' ? 'active' : '' %>"><i class="fas fa-video"></i> Equipment</a></li>
+      <li><a href="/calendar" class="nav-link <%= currentPath === '/calendar' ? 'active' : '' %>"><i class="fas fa-calendar-alt"></i> Calendar</a></li>
+      <li><a href="/customers" class="nav-link <%= currentPath === '/customers' ? 'active' : '' %>"><i class="fas fa-users"></i> Customers</a></li>
+      <% if (isAdmin) { %>
+      <li><a href="/notifications" class="nav-link <%= currentPath === '/notifications' ? 'active' : '' %>"><i class="fas fa-bell"></i> Reminders</a></li>
+      <li><a href="/payments" class="nav-link <%= currentPath === '/payments' ? 'active' : '' %>"><i class="fas fa-money-bill-wave"></i> Payments</a></li>
+      <li><a href="/users" class="nav-link <%= currentPath === '/users' ? 'active' : '' %>"><i class="fas fa-user-shield"></i> User Management</a></li>
+      <% } %>
+      <li class="mt-4"><form method="post" action="/logout"><button class="nav-link text-danger border-0 bg-transparent w-100 text-start"><i class="fas fa-sign-out-alt"></i> Logout</button></form></li>
+    </ul>
+  </nav>
+  <main class="flex-grow-1 p-4 overflow-auto">

@@ -1,0 +1,19 @@
+{
+  "name": "rentmaster-v7",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node.js version of the RentMaster studio operations app",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "dev": "node --watch server.js", "migrate:mysql": "node scripts/migrate-mysql-to-postgres.js" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
+    "bcryptjs": "^2.4.3",
+    "cookie-session": "^2.1.0",
+    "dotenv": "^16.4.7",
+    "ejs": "^3.1.10",
+    "express": "^4.21.2",
+    "multer": "^2.0.2",
+    "pg": "^8.16.3",
+    "mysql2": "^3.15.3"
+  }
+}
