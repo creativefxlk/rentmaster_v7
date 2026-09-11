@@ -41,13 +41,9 @@ For private documents, keep the bucket private and replace public URLs with sign
 
 ## 4. Deploy to Vercel
 
-Push the repository to GitHub, then create a Vercel project from it.
-
-Set the Vercel project **Root Directory** to:
-
-```text
-rentmaster_V7
-```
+Push the repository to GitHub, then create a Vercel project from it. Leave the
+Vercel project **Root Directory** at the repository root (the default), because
+`package.json`, `vercel.json`, and `api/` are already at the top level.
 
 Vercel detects [`vercel.json`](vercel.json), which sends requests to [`api/index.js`](api/index.js).
 
