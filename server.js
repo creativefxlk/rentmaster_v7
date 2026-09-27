@@ -7,6 +7,7 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const { Pool } = require('pg');
 const { createClient } = require('@supabase/supabase-js');
+const receipts = require('./lib/receipts');
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -28,6 +29,9 @@ app.set('views', path.join(__dirname, 'views'));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+// Vercel terminates TLS at the edge, so the function sees plain HTTP. Without this,
+// req.protocol is "http" and the secure session cookie is silently dropped.
+app.set('trust proxy', 1);
 app.use(cookieSession({
   name: 'rentmaster-session',
   keys: [process.env.SESSION_SECRET || 'rentmaster-development-secret'],
@@ -60,8 +64,15 @@ async function availableEquipment() {
 }
 
 async function activeRentals() {
-  const { rows } = await pool.query('SELECT r.id, e.name AS "equipmentName", c.name AS "customerName", r.expected_return AS "expectedReturn", r.total_fee AS "totalFee", r.amount_paid AS "amountPaid" FROM rentals r JOIN equipment e ON r.equipment_id = e.id JOIN customers c ON r.customer_id = c.id WHERE r.actual_return IS NULL ORDER BY r.expected_return ASC');
-  return rows;
+  const { rows } = await pool.query('SELECT r.id, e.name AS "equipmentName", c.name AS "customerName", c.email, r.rent_date AS "rentDate", r.expected_return AS "expectedReturn", r.total_fee AS "totalFee", r.amount_paid AS "amountPaid", r.deposit, r.daily_price AS "dailyPrice", r.booked_days AS "bookedDays" FROM rentals r JOIN equipment e ON r.equipment_id = e.id JOIN customers c ON r.customer_id = c.id WHERE r.actual_return IS NULL ORDER BY r.expected_return ASC');
+  // Project what the return would settle at right now, for the return dialog.
+  return rows.map(row => {
+    const actualDays = billableDays(row.rentDate, new Date());
+    const bookedDays = Number(row.bookedDays) || billableDays(row.rentDate, row.expectedReturn);
+    const originalTotal = Number(row.totalFee);
+    const finalTotal = actualDays < bookedDays ? Math.min(originalTotal, Number(row.dailyPrice) * actualDays) : originalTotal;
+    return { ...row, actualDays, bookedDays, finalTotal, balanceDue: Math.max(0, finalTotal - Number(row.amountPaid)), refundDue: Math.max(0, Number(row.amountPaid) - finalTotal) };
+  });
 }
 
 async function uploadIdImage(file) {
@@ -70,8 +81,26 @@ async function uploadIdImage(file) {
   const objectPath = `id-documents/${Date.now()}-${Math.random().toString(36).slice(2)}${extension}`;
   const { error } = await supabase.storage.from(uploadBucket).upload(objectPath, file.buffer, { contentType: file.mimetype, upsert: false });
   if (error) throw error;
-  const { data } = supabase.storage.from(uploadBucket).getPublicUrl(objectPath);
-  return data.publicUrl;
+  return objectPath;
+}
+
+// Any started day counts as a full rental day; a rental is always at least one day.
+function billableDays(from, to) {
+  const start = new Date(from), end = new Date(to);
+  if (isNaN(start) || isNaN(end) || end <= start) return 1;
+  return Math.max(1, Math.ceil((end - start) / 86400000));
+}
+
+const PAYMENT_METHODS = new Set(['cash', 'bank_transfer', 'online']);
+const PAYMENT_METHOD_LABELS = { cash: 'Cash', bank_transfer: 'Bank transfer', online: 'Online payment' };
+
+// Bank and online advances must carry a traceable reference; cash takes an optional note.
+function normalizePayment(method, reference, amount) {
+  const chosen = String(method || 'cash').trim();
+  if (!PAYMENT_METHODS.has(chosen)) throw new Error('Choose how the advance payment was received.');
+  const note = String(reference || '').trim().slice(0, 120);
+  if (amount > 0 && chosen !== 'cash' && !note) throw new Error('Add the bank or online transfer reference number for this advance payment.');
+  return { method: chosen, reference: note || null };
 }
 
 function whatsappLink(phone, message) {
@@ -114,23 +143,51 @@ app.get('/rent', requireAuth, async (req, res, next) => { try { res.render('rent
 app.post('/rent', requireAuth, upload.single('nicImage'), async (req, res, next) => {
   const client = await pool.connect();
   try {
-    const { equipmentId, customerName, nic, phone, startDate, endDate, totalFee, amountPaid, signature } = req.body;
+    const { equipmentId, customerName, nic, phone, email, startDate, endDate, totalFee, amountPaid, deposit, paymentMethod, paymentReference, signature } = req.body;
+    const clientEmail = String(email || '').trim().slice(0, 255) || null;
+    const advance = Math.max(0, Number(amountPaid) || 0);
+    const depositAmount = Math.max(0, Number(deposit) || 0);
+    const payment = normalizePayment(paymentMethod, paymentReference, advance);
     await client.query('BEGIN');
-    const { rows: itemRows } = await client.query("SELECT id, name FROM equipment WHERE id = $1 AND status = 'Available' FOR UPDATE", [equipmentId]);
+    const { rows: itemRows } = await client.query("SELECT id, name, type, daily_price FROM equipment WHERE id = $1 AND status = 'Available' FOR UPDATE", [equipmentId]);
     const item = itemRows[0];
     if (!item) throw new Error('The selected equipment is no longer available.');
     const imageUrl = await uploadIdImage(req.file);
     const { rows: customerRows } = await client.query('SELECT id FROM customers WHERE nic = $1', [String(nic).trim()]);
     let customerId = customerRows[0]?.id;
-    if (!customerId) { const created = await client.query('INSERT INTO customers (name, nic, phone, id_image) VALUES ($1, $2, $3, $4) RETURNING id', [String(customerName).trim(), String(nic).trim(), String(phone).trim(), imageUrl]); customerId = created.rows[0].id; }
-    else if (imageUrl) await client.query('UPDATE customers SET id_image = $1 WHERE id = $2', [imageUrl, customerId]);
-    const rental = await client.query('INSERT INTO rentals (equipment_id, customer_id, rent_date, expected_return, total_fee, amount_paid, signature) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id', [equipmentId, customerId, startDate, endDate, Math.max(0, Number(totalFee)), Math.max(0, Number(amountPaid)), signature || null]);
-    if (Number(amountPaid) > 0) await client.query("INSERT INTO payment_transactions (rental_id, amount, payment_type) VALUES ($1, $2, 'checkout')", [rental.rows[0].id, Number(amountPaid)]);
+    if (!customerId) { const created = await client.query('INSERT INTO customers (name, nic, phone, email, id_image) VALUES ($1, $2, $3, $4, $5) RETURNING id', [String(customerName).trim(), String(nic).trim(), String(phone).trim(), clientEmail, imageUrl]); customerId = created.rows[0].id; }
+    else {
+      if (imageUrl) await client.query('UPDATE customers SET id_image = $1 WHERE id = $2', [imageUrl, customerId]);
+      if (clientEmail) await client.query('UPDATE customers SET email = $1 WHERE id = $2', [clientEmail, customerId]);
+    }
+    const bookedDays = billableDays(startDate, endDate);
+    const agreedTotal = Math.max(0, Number(totalFee));
+    const rental = await client.query('INSERT INTO rentals (equipment_id, customer_id, rent_date, expected_return, total_fee, amount_paid, deposit, daily_price, booked_days, signature) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id', [equipmentId, customerId, startDate, endDate, agreedTotal, advance, depositAmount, Number(item.daily_price), bookedDays, signature || null]);
+    if (advance > 0) await client.query("INSERT INTO payment_transactions (rental_id, amount, payment_type, method, reference) VALUES ($1, $2, 'checkout', $3, $4)", [rental.rows[0].id, advance, payment.method, payment.reference]);
     await client.query("UPDATE equipment SET status = 'Rented' WHERE id = $1", [equipmentId]);
     await client.query('COMMIT');
-    const message = `Hi ${customerName}, thank you for renting from RentMaster. You rented ${item.name} from ${new Date(startDate).toLocaleString()} until ${new Date(endDate).toLocaleString()}. Amount paid: LKR ${Number(amountPaid).toFixed(2)}. Please return it before ${new Date(endDate).toLocaleString()}. Thank you for choosing RentMaster!`;
+    await receipts.send('checkout', {
+      email: clientEmail, rentalId: rental.rows[0].id, customerName: String(customerName).trim(), nic: String(nic).trim(), phone: String(phone).trim(),
+      equipmentName: item.name, equipmentType: item.type, startDate, endDate, bookedDays,
+      dailyPrice: Number(item.daily_price), totalFee: agreedTotal, advance, deposit: depositAmount,
+      method: payment.method, reference: payment.reference
+    });
+    const message = `Hi ${customerName}, thank you for renting from RentMaster. You rented ${item.name} from ${new Date(startDate).toLocaleString()} until ${new Date(endDate).toLocaleString()}. Advance paid: LKR ${advance.toFixed(2)} (${PAYMENT_METHOD_LABELS[payment.method]}). Refundable deposit: LKR ${depositAmount.toFixed(2)}. Please return it before ${new Date(endDate).toLocaleString()}. Thank you for choosing RentMaster!`;
     res.render('rent', { equipment: await availableEquipment(), success: 'Rental logged, documents saved, and signature secured!', whatsappLink: whatsappLink(phone, message), error: null });
   } catch (error) { await client.query('ROLLBACK'); const equipment = await availableEquipment(); res.status(400).render('rent', { equipment, success: null, whatsappLink: null, error: error.message }); } finally { client.release(); }
+});
+
+app.get('/customers/:id/document', requireAuth, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query('SELECT id_image FROM customers WHERE id = $1', [req.params.id]);
+    const stored = rows[0]?.id_image;
+    if (!stored) return res.status(404).send('No ID document is on file for this customer.');
+    if (/^https?:\/\//i.test(stored)) return res.redirect(stored);
+    if (!supabase) return res.status(503).send('Supabase Storage is not configured.');
+    const { data, error } = await supabase.storage.from(uploadBucket).createSignedUrl(stored.replace(/^uploads\//, ''), 60);
+    if (error) return res.status(404).send('That ID document could not be found in storage.');
+    res.redirect(data.signedUrl);
+  } catch (error) { next(error); }
 });
 
 app.get('/customers', requireAuth, async (req, res, next) => { try { const { rows: customers } = await pool.query('SELECT id, name, nic, phone, id_image FROM customers ORDER BY name ASC'); res.render('customers', { customers }); } catch (error) { next(error); } });
@@ -142,7 +199,40 @@ app.post('/equipment', requireAuth, async (req, res, next) => {
     if (action === 'add') await pool.query('INSERT INTO equipment (name, type, daily_price, status) VALUES ($1, $2, $3, $4)', [name.trim(), type.trim(), Math.max(0, Number(dailyPrice)), status]);
     if (action === 'update') await pool.query('UPDATE equipment SET name = $1, type = $2, daily_price = $3, status = $4 WHERE id = $5', [name.trim(), type.trim(), Math.max(0, Number(dailyPrice)), status, equipmentId]);
     if (action === 'delete' && req.session.user.role === 'admin') await pool.query("DELETE FROM equipment WHERE id = $1 AND status != 'Rented'", [equipmentId]);
-    if (action === 'return') { const client = await pool.connect(); try { await client.query('BEGIN'); const { rows } = await client.query('SELECT equipment_id, total_fee, amount_paid FROM rentals WHERE id = $1 AND actual_return IS NULL FOR UPDATE', [equipmentId]); const rental = rows[0]; if (rental) { const payment = Math.min(Number(req.body.returnPayment || 0), Math.max(0, Number(rental.total_fee) - Number(rental.amount_paid))); await client.query('UPDATE rentals SET actual_return = NOW(), amount_paid = amount_paid + $1 WHERE id = $2', [payment, equipmentId]); if (payment > 0) await client.query("INSERT INTO payment_transactions (rental_id, amount, payment_type) VALUES ($1, $2, 'return')", [equipmentId, payment]); await client.query("UPDATE equipment SET status = 'Available' WHERE id = $1", [rental.equipment_id]); } await client.query('COMMIT'); } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); } }
+    if (action === 'return') {
+      const client = await pool.connect();
+      let finalReceipt = null;
+      try {
+        await client.query('BEGIN');
+        const { rows } = await client.query("SELECT r.id, r.equipment_id, r.rent_date, r.expected_return, r.total_fee, r.amount_paid, r.deposit, r.daily_price, r.booked_days, e.name AS equipment_name, e.type AS equipment_type, c.name AS customer_name, c.email FROM rentals r JOIN equipment e ON r.equipment_id = e.id JOIN customers c ON r.customer_id = c.id WHERE r.id = $1 AND r.actual_return IS NULL FOR UPDATE OF r", [equipmentId]);
+        const rental = rows[0];
+        if (rental) {
+          const returnedAt = new Date();
+          const actualDays = billableDays(rental.rent_date, returnedAt);
+          const bookedDays = Number(rental.booked_days) || billableDays(rental.rent_date, rental.expected_return);
+          const originalTotal = Number(rental.total_fee);
+          // An early return is recharged at the agreed daily rate, and can never
+          // cost more than the total the client originally agreed to.
+          const finalTotal = actualDays < bookedDays ? Math.min(originalTotal, Number(rental.daily_price) * actualDays) : originalTotal;
+          const alreadyPaid = Number(rental.amount_paid);
+          const collected = Math.min(Math.max(0, Number(req.body.returnPayment) || 0), Math.max(0, finalTotal - alreadyPaid));
+          const refund = Math.max(0, alreadyPaid - finalTotal);
+          const deduction = Math.min(Math.max(0, Number(req.body.depositDeduction) || 0), Number(rental.deposit));
+          const reason = String(req.body.depositDeductionReason || '').trim().slice(0, 255) || null;
+          const returnPay = normalizePayment(req.body.returnMethod, req.body.returnReference, collected);
+
+          await client.query('UPDATE rentals SET actual_return = $1, actual_days = $2, total_fee = $3, amount_paid = amount_paid + $4 - $5, deposit_deduction = $6, deposit_deduction_reason = $7 WHERE id = $8', [returnedAt, actualDays, finalTotal, collected, refund, deduction, deduction > 0 ? reason : null, rental.id]);
+          if (collected > 0) await client.query("INSERT INTO payment_transactions (rental_id, amount, payment_type, method, reference) VALUES ($1, $2, 'return', $3, $4)", [rental.id, collected, returnPay.method, returnPay.reference]);
+          // Refunds are negative ledger rows so SUM(amount) stays truthful.
+          if (refund > 0) await client.query("INSERT INTO payment_transactions (rental_id, amount, payment_type, method) VALUES ($1, $2, 'refund', $3)", [rental.id, -refund, returnPay.method]);
+          await client.query("UPDATE equipment SET status = 'Available' WHERE id = $1", [rental.equipment_id]);
+
+          finalReceipt = { email: rental.email, rentalId: rental.id, customerName: rental.customer_name, equipmentName: rental.equipment_name, equipmentType: rental.equipment_type, startDate: rental.rent_date, endDate: rental.expected_return, actualReturn: returnedAt, bookedDays, actualDays, dailyPrice: Number(rental.daily_price), originalTotal, finalTotal, advance: alreadyPaid, collected, refund, deposit: Number(rental.deposit), deduction, deductionReason: reason };
+        }
+        await client.query('COMMIT');
+      } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
+      if (finalReceipt) await receipts.send('final', finalReceipt);
+    }
     res.redirect('/equipment');
   } catch (error) { const { rows: equipment } = await pool.query('SELECT id, name, type, daily_price, status FROM equipment ORDER BY type ASC'); res.status(400).render('equipment', { equipment, activeRentals: await activeRentals(), error: 'This equipment cannot be deleted because it has rental history.' }); }
 });
@@ -150,7 +240,7 @@ app.post('/equipment', requireAuth, async (req, res, next) => {
 app.get('/calendar', requireAuth, async (req, res, next) => { try { const { rows: rentals } = await pool.query('SELECT r.id, e.name AS title, r.rent_date AS start, r.expected_return AS end, r.actual_return AS "actualReturn" FROM rentals r JOIN equipment e ON r.equipment_id = e.id'); const { rows: customEvents } = await pool.query('SELECT id, title, start_date AS start, end_date AS end FROM calendar_events'); const events = [...rentals.map(rental => ({ title: `Out: ${rental.title}`, start: rental.start, end: rental.end, color: rental.actualReturn ? '#2c3e50' : '#e34b3f' })), ...customEvents.map(event => ({ ...event, id: `custom-${event.id}`, color: '#f39c12', extendedProps: { customId: event.id } }))]; res.render('calendar', { events, activeRentalCount: rentals.filter(rental => !rental.actualReturn).length, manualEventCount: customEvents.length }); } catch (error) { next(error); } });
 app.post('/calendar', requireAuth, async (req, res, next) => { try { if (req.body.action === 'delete') await pool.query('DELETE FROM calendar_events WHERE id = $1', [req.body.eventId]); if (req.body.action === 'save') { if (req.body.eventId) await pool.query('UPDATE calendar_events SET title = $1, start_date = $2, end_date = $3 WHERE id = $4', [req.body.title, req.body.startDate, req.body.endDate, req.body.eventId]); else await pool.query('INSERT INTO calendar_events (title, start_date, end_date) VALUES ($1, $2, $3)', [req.body.title, req.body.startDate, req.body.endDate]); } res.redirect('/calendar'); } catch (error) { next(error); } });
 
-app.get('/payments', requireAdmin, async (req, res, next) => { try { const { rows: summaryRows } = await pool.query('SELECT COALESCE(SUM(amount_paid), 0) AS collected, COALESCE(SUM(GREATEST(total_fee - amount_paid, 0)), 0) AS outstanding, COUNT(*)::int AS rentals FROM rentals'); const { rows: payments } = await pool.query('SELECT p.id, p.amount, p.payment_type AS "paymentType", p.paid_at AS "paidAt", c.name AS "customerName", c.phone, e.name AS "equipmentName", r.total_fee AS "totalFee", r.amount_paid AS "amountPaid" FROM payment_transactions p JOIN rentals r ON p.rental_id = r.id JOIN customers c ON r.customer_id = c.id JOIN equipment e ON r.equipment_id = e.id ORDER BY p.paid_at DESC, p.id DESC'); res.render('payments', { summary: summaryRows[0], payments }); } catch (error) { next(error); } });
+app.get('/payments', requireAdmin, async (req, res, next) => { try { const { rows: summaryRows } = await pool.query('SELECT COALESCE(SUM(amount_paid), 0) AS collected, COALESCE(SUM(GREATEST(total_fee - amount_paid, 0)), 0) AS outstanding, COUNT(*)::int AS rentals FROM rentals'); const { rows: payments } = await pool.query('SELECT p.id, p.amount, p.payment_type AS "paymentType", p.method, p.reference, p.paid_at AS "paidAt", c.name AS "customerName", c.phone, e.name AS "equipmentName", r.total_fee AS "totalFee", r.amount_paid AS "amountPaid", r.deposit FROM payment_transactions p JOIN rentals r ON p.rental_id = r.id JOIN customers c ON r.customer_id = c.id JOIN equipment e ON r.equipment_id = e.id ORDER BY p.paid_at DESC, p.id DESC'); res.render('payments', { summary: summaryRows[0], payments, methodLabels: PAYMENT_METHOD_LABELS }); } catch (error) { next(error); } });
 app.get('/notifications', requireAdmin, async (req, res, next) => { try { const { rows: upcoming } = await pool.query("SELECT r.id, e.name AS \"equipmentName\", c.name AS \"customerName\", c.phone, r.expected_return AS \"expectedReturn\" FROM rentals r JOIN equipment e ON r.equipment_id = e.id JOIN customers c ON r.customer_id = c.id WHERE r.actual_return IS NULL AND DATE(r.expected_return) = CURRENT_DATE + INTERVAL '1 day'"); const { rows: overdue } = await pool.query("SELECT r.id, e.name AS \"equipmentName\", c.name AS \"customerName\", c.phone, r.expected_return AS \"expectedReturn\" FROM rentals r JOIN equipment e ON r.equipment_id = e.id JOIN customers c ON r.customer_id = c.id WHERE r.actual_return IS NULL AND r.expected_return < NOW()"); res.render('notifications', { upcoming: upcoming.map(item => ({ ...item, link: whatsappLink(item.phone, `Hi ${item.customerName}, this is a quick reminder from RentMaster. Your rental for the ${item.equipmentName} is due back tomorrow. Thank you!`) })), overdue: overdue.map(item => ({ ...item, link: whatsappLink(item.phone, `Alert from RentMaster: Hi ${item.customerName}, your equipment return for the ${item.equipmentName} is currently overdue. Please contact the studio immediately.`) })) }); } catch (error) { next(error); } });
 app.get('/users', requireAdmin, async (req, res, next) => { try { const { rows: users } = await pool.query('SELECT id, username, role FROM users ORDER BY role ASC, username ASC'); res.render('users', { users, message: null, error: null }); } catch (error) { next(error); } });
 app.post('/users', requireAdmin, async (req, res, next) => { try { let message = null; if (req.body.action === 'add') { await pool.query('INSERT INTO users (username, password, role) VALUES ($1, $2, $3)', [req.body.username.trim(), await bcrypt.hash(req.body.password, 10), req.body.role]); message = `New user '${req.body.username.trim()}' created successfully!`; } if (req.body.action === 'password') { await pool.query('UPDATE users SET password = $1 WHERE id = $2', [await bcrypt.hash(req.body.newPassword, 10), req.body.userId]); message = 'Password updated successfully!'; } const { rows: users } = await pool.query('SELECT id, username, role FROM users ORDER BY role ASC, username ASC'); res.render('users', { users, message, error: null }); } catch (error) { const { rows: users } = await pool.query('SELECT id, username, role FROM users ORDER BY role ASC, username ASC'); res.status(400).render('users', { users, message: null, error: 'Username may already exist in the system.' }); } });

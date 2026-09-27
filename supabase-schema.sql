@@ -6,7 +6,11 @@ DO $$ BEGIN
   CREATE TYPE equipment_status AS ENUM ('Available', 'Rented', 'Maintenance');
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
-DO $$ BEGIN
+DO $ BEGIN
+  CREATE TYPE payment_method AS ENUM ('cash', 'bank_transfer', 'online');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $;
+DO $ BEGIN
   CREATE TYPE payment_type AS ENUM ('checkout', 'return');
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
@@ -43,6 +47,7 @@ CREATE TABLE IF NOT EXISTS rentals (
   actual_return TIMESTAMP,
   total_fee NUMERIC(10, 2) DEFAULT 0,
   amount_paid NUMERIC(10, 2) DEFAULT 0,
+  deposit NUMERIC(10, 2) NOT NULL DEFAULT 5000,
   signature TEXT
 );
 
@@ -59,6 +64,8 @@ CREATE TABLE IF NOT EXISTS payment_transactions (
   rental_id BIGINT NOT NULL REFERENCES rentals(id) ON DELETE CASCADE,
   amount NUMERIC(10, 2) NOT NULL,
   payment_type payment_type NOT NULL,
+  method payment_method NOT NULL DEFAULT 'cash',
+  reference VARCHAR(120),
   paid_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

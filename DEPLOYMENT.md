@@ -34,10 +34,9 @@ Never expose the service-role key in frontend JavaScript. It belongs only in Ver
 
 1. Open **Storage** in Supabase.
 2. Create a bucket named `rentmaster-uploads`.
-3. Make the bucket public if customer ID document links should open directly.
-4. The V7 server uploads NIC/passport images into `id-documents/` and stores the public URL in `customers.id_image`.
-
-For private documents, keep the bucket private and replace public URLs with signed URLs before production use.
+3. Keep the bucket **private**. Customer NIC/passport scans must not be world-readable.
+4. The V7 server uploads NIC/passport images into `id-documents/` and stores the **object path** (not a URL) in `customers.id_image`.
+5. Documents are served through `GET /customers/:id/document`, which requires a logged-in session and issues a 60-second Supabase signed URL.
 
 ## 4. Deploy to Vercel
 
@@ -51,7 +50,6 @@ Add these Production environment variables in Vercel:
 
 ```env
 NODE_ENV=production
-VERCEL=1
 SESSION_SECRET=replace-with-a-long-random-secret
 DATABASE_URL=postgresql://postgres.<project-ref>:<password>@<pooler-host>:6543/postgres
 SUPABASE_URL=https://<project-ref>.supabase.co
@@ -59,7 +57,37 @@ SUPABASE_SERVICE_ROLE_KEY=<server-only-service-role-key>
 SUPABASE_STORAGE_BUCKET=rentmaster-uploads
 ```
 
+Do not set `VERCEL` yourself; Vercel injects `VERCEL=1` at runtime and rejects the reserved name.
+
 Redeploy after adding or changing environment variables. Open the deployed URL at `/login`.
+
+## 4b. Receipt email (Resend)
+
+Receipts are emailed at checkout (agreement + advance) and at return (final,
+with any early-return recalculation).
+
+1. Create an account at https://resend.com and verify your sending domain.
+2. Create an API key.
+3. Add to Vercel:
+
+```env
+RESEND_API_KEY=re_xxxxxxxxxxxx
+RECEIPT_FROM=RentMaster <receipts@yourdomain.com>
+```
+
+Without `RESEND_API_KEY` the app still works: receipts are skipped, or written
+as HTML to `RECEIPT_LOG_DIR` when that is set. A failing receipt never fails
+the rental it describes.
+
+## 4c. Database migrations
+
+Run the files in `migrations/` in order against the Supabase database, after
+`supabase-schema.sql`. They are additive and safe to re-run:
+
+```bash
+psql "$DATABASE_URL?sslmode=require" -f migrations/001-advance-payment-and-deposit.sql
+psql "$DATABASE_URL?sslmode=require" -f migrations/002-email-receipts-and-early-return.sql
+```
 
 ## 5. Migrate existing MySQL data
 
@@ -111,6 +139,10 @@ git push origin main
 
 - V7 uses PostgreSQL placeholders and schema; do not use the old MySQL `database.sql` with this project.
 - Vercel functions are stateless. V7 uses signed cookie sessions instead of in-memory Express sessions.
+- `app.set('trust proxy', 1)` is required. Vercel terminates TLS at the edge, so without it `req.protocol` is `http`, the `secure` session cookie is silently dropped, and login redirects back to `/login` forever.
+- `vercel.json` must keep `includeFiles: "views/**"`. The EJS templates are read at runtime, so the bundler cannot trace them and pages return 500 without it.
+- Node 22 or newer is required; `@supabase/supabase-js` needs a native `WebSocket`, which Node 18 does not provide.
 - Vercel local disk is temporary. V7 uses Supabase Storage for uploaded ID documents.
 - The existing PHP app and MySQL-based Node app remain unchanged in their original folders.
-- Add CSRF protection, rate limiting, strict upload validation, and private Storage policies before exposing sensitive customer documents publicly.
+- The uploads bucket is private and capped at 5 MB with an image/PDF MIME allowlist.
+- Still outstanding before wider rollout: CSRF protection and rate limiting on `/login`.
