@@ -4,6 +4,7 @@
   "private": true,
   "description": "Node.js version of the RentMaster studio operations app",
   "main": "server.js",
+  "engines": { "node": "22.x" },
   "scripts": { "start": "node server.js", "dev": "node --watch server.js", "migrate:mysql": "node scripts/migrate-mysql-to-postgres.js" },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",
